@@ -1,0 +1,10 @@
+[build]
+target = "thumbv7em-none-eabihf"
+build-std = ["core", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+    
+]

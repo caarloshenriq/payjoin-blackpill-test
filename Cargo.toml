@@ -1,0 +1,21 @@
+[package]
+name = "payjoin-blackpill-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+payjoin = { path = "../rust-payjoin/payjoin", default-features = false, features = ["v2"] }
+cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+panic-halt = "1.0"
+linked_list_allocator = "0.10"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+incremental = false
+debug = 2
+split-debuginfo = "unpacked"
