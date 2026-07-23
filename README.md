@@ -5,9 +5,8 @@
 
 # payjoin-blackpill-test — `payjoin` no_std on STM32F411CEU6 (Black Pill)
 
-Compile and run `payjoin` (no_std, v2 features) on a bare-metal STM32F411CEU6
-microcontroller (ARM Cortex-M4F, `thumbv7em-none-eabihf`). Results are
-signalled via the onboard LED on PC13.
+Compile `payjoin` (no_std, v2 features) on a bare-metal STM32F411CEU6
+microcontroller (ARM Cortex-M4F, `thumbv7em-none-eabihf`).
 
 This is a companion test to
 [payjoin-pico2-test](https://github.com/benalleng/payjoin-pico2), which tested
@@ -16,7 +15,7 @@ target: `thumbv7em-none-eabihf`.
 
 ## What is tested
 
-- `payjoin::directory::ShortId` round-trip (bytes → bech32m → ShortId)
+- `payjoin::directory::ShortId` round-trip (sha256::Hash → ShortId → bech32m → ShortId)
 - SHA256 → ShortId mailbox derivation (used by v2 receiver)
 
 The full `receive::v2` receiver state machine is gated on `v2-ohttp` (requires
@@ -29,10 +28,9 @@ The full `receive::v2` receiver state machine is gated on `v2-ohttp` (requires
 
 ## LED output (PC13, active low)
 
-| Pattern | Meaning |
-|---|---|
-| 3 rapid blinks on boot | Device started successfully |
-| 2 blinks, repeating | **PASS** — all tests passed |
+| Pattern             | Meaning                             |
+| ------------------- | ----------------------------------- |
+| LED on solid        | **PASS** — all tests passed         |
 | 5 blinks, repeating | **FAIL** — one or more tests failed |
 
 ## Prerequisites
@@ -59,25 +57,26 @@ cargo build --release
 ## Flash via DFU (no ST-Link required)
 
 **1. Enter DFU mode** — hold `BOOT0` button, tap `RESET`, then release `BOOT0`.
-The device appears as `0483:df11`:
+Confirm the device appears as `0483:df11`:
 
 ```sh
-lsusb | grep DFU
+lsusb | grep -i dfu
 ```
 
-**2. Flash:**
+**2. Flash (run from inside the embedded devShell):**
 
 ```sh
-dfu-util -a 0 -s 0x08000000:leave -D \
+sudo $(which dfu-util) -a 0 -s 0x08000000:leave -D \
   target/thumbv7em-none-eabihf/release/payjoin-blackpill-test
 ```
 
-The `-s ...:leave` flag reboots the device after flashing.
+> **Note:** DFU flashing stability depends on the USB cable. If the transfer
+> fails, retry the command — the device remains in DFU mode after a failed
+> attempt. A data-capable USB-C cable is required.
 
 **3. Observe the LED (PC13)**
 
-- 3 rapid blinks → booted
-- 2 blinks repeating → **PASS**
+- LED on solid → **PASS**
 - 5 blinks repeating → **FAIL**
 
 ## Dependencies
