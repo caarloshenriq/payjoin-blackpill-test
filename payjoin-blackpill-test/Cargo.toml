@@ -5,7 +5,11 @@ edition = "2024"
 publish = false
 
 [dependencies]
-payjoin = { path = "../../rust-payjoin/payjoin", default-features = false, features = ["v2"] }
+payjoin = { git = "https://github.com/caarloshenriq/rust-payjoin", branch = "feat/payjoin-nostd", default-features = false, features = [
+  "alloc",
+  "v1",
+  "v2",
+] }
 cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"
 panic-halt = "1.0"
