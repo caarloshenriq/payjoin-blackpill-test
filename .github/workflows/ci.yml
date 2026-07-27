@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Built one at a time with -p, not `cargo build --workspace`.
+        # payjoin-blackpill-test (raw-register LED/ShortId, no HAL) and
+        # the USB-based crates (which pull in stm32f4xx-hal, enabling
+        # cortex-m-rt's `device` feature) can't share a single build
+        # invocation without Cargo unifying that feature across every
+        # package being built together -- that broke the LED build
+        # during local bring-up, see project history.
+        crate:
+          - payjoin-blackpill-test
+          - led-blink
+          - usb-echo
+          - usb-harness
+          - usb-harness-sender
+          - usb-harness-v2
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.crate }}
+
+      # No hardware in CI: this only proves the firmware still compiles
+      # for the real target. It does NOT flash or run anything -- that
+      # still has to happen manually against real boards (see the
+      # repo's README for the SWD/probe-rs flashing steps).
+      - run: |
+          nix develop -c cargo build --release \
+            --target thumbv7em-none-eabihf \
+            -p ${{ matrix.crate }}
