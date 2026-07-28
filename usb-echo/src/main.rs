@@ -1,175 +1,40 @@
-//! Stage B: wires real USB CDC ACM into harness_device's receiver role.
-//! USB bring-up here is copy-identical to usb-echo (confirmed working on
-//! real hardware: enumerates, /dev/ttyACM0, echoes bytes) -- the only
-//! difference is what happens with the bytes once they're flowing: here
-//! they go through harness_device::run_receiver instead of a bare echo.
+//! Stage A: bare USB CDC ACM echo. Proves the board enumerates as a
+//! serial port and can move bytes, before any harness-device logic gets
+//! wired in (usb-harness/, once this is confirmed working).
 //!
-//! Not yet run on hardware. usb-echo proved the USB stack itself works;
-//! this proves (once tested) that harness-device's payjoin logic runs
-//! correctly against real bytes over a real USB link, not just the
-//! in-memory channel used in harness-device's own tests.
+//! Confirmed working on real hardware (WeAct STM32F411CEU6 Black Pill):
+//! enumerates as idVendor=16c0, idProduct=27dd ("harness-device USB
+//! CDC"), creates /dev/ttyACM0, echoes bytes back correctly.
 //!
-//! ASSUMPTIONS THAT STILL NEED HARDWARE VERIFICATION, on top of what
-//! usb-echo already confirmed (clock, pins, USB bring-up):
-//!   - Heap size (64 KiB) is a guess. usb-echo never touched payjoin's
-//!     PSBT/secp256k1 code paths at all; run_receiver does real BIP78
-//!     validation + PSBT parsing, which allocates more. If this hangs or
-//!     hard-faults where usb-echo didn't, the heap size is the first
-//!     thing to suspect -- bump it and see if the symptom changes.
-//!   - The fixture receiver script (WPubkeyHash of all-0x22 bytes)
-//!     matches harness-device's own `original_psbt_fixture()` test
-//!     helper, so a harness-host driven by that same fixture should be
-//!     able to talk to this board. A real deployment would derive this
-//!     from the board's own wallet descriptor instead of a hardcoded
-//!     fixture.
-//!   - No status signal on failure yet: run_receiver's Result is
-//!     discarded (see the loop below). If this doesn't work, the first
-//!     useful addition is reusing the LED-on/off convention from the
-//!     other test firmwares to distinguish "waiting for a frame" from
-//!     "got a frame and it failed to parse/validate" -- right now both
-//!     look identical from outside (LED just stays on, no poll-loop
-//!     visual difference).
+//! Flashing notes:
+//!   - DFU (dfu-util) was unreliable for this board/cable/adapter
+//!     combination in practice -- transfers of any real size tended to
+//!     fail partway through with LIBUSB_ERROR_IO/LIBUSB_ERROR_PIPE. SWD
+//!     via an ST-Link (probe-rs) was reliable and is what actually got
+//!     this flashed and confirmed:
+//!       cargo build --release --target thumbv7em-none-eabihf -p usb-echo
+//!       probe-rs run --chip STM32F411CEUx target/thumbv7em-none-eabihf/release/usb-echo
+//!   - This binary needs its OWN USB-C cable connected from the board to
+//!     the PC to be visible as a serial device -- the ST-Link's USB
+//!     connection (used only for flashing/debug via SWD) is separate and
+//!     does not carry the board's own USB CDC traffic.
 
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-
-use bitcoin::hashes::Hash;
 use cortex_m_rt::entry;
-use harness_device::{Transport, run_receiver};
-use linked_list_allocator::LockedHeap;
 use panic_halt as _;
 use stm32f4xx_hal::{
     gpio::alt::otg_fs::{Dm, Dp},
-    otg_fs::{USB, UsbBus, UsbBusType},
+    otg_fs::{USB, UsbBus},
     pac,
     prelude::*,
 };
-use usb_device::UsbError;
 use usb_device::prelude::*;
 use usbd_serial::SerialPort;
 
-#[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
-
-static mut HEAP: [u8; 16 * 1024] = [0; 16 * 1024];
-
-const RCC_AHB1ENR: *mut u32 = 0x4002_3830 as *mut u32;
-const GPIOC_MODER: *mut u32 = 0x4002_0800 as *mut u32;
-const GPIOC_ODR: *mut u32 = 0x4002_0814 as *mut u32;
-const GPIOCEN: u32 = 1 << 2;
-const PIN13_OUTPUT: u32 = 0b01 << (13 * 2);
-const PIN13_MODER_MASK: u32 = 0b11 << (13 * 2);
-const PIN13_BIT: u32 = 1 << 13;
-
-fn init_led() {
-    unsafe {
-        core::ptr::write_volatile(RCC_AHB1ENR, core::ptr::read_volatile(RCC_AHB1ENR) | GPIOCEN);
-        let moder = core::ptr::read_volatile(GPIOC_MODER);
-        core::ptr::write_volatile(GPIOC_MODER, (moder & !PIN13_MODER_MASK) | PIN13_OUTPUT);
-    }
-}
-
-fn led_on() {
-    unsafe {
-        let odr = core::ptr::read_volatile(GPIOC_ODR);
-        core::ptr::write_volatile(GPIOC_ODR, odr & !PIN13_BIT); // active-low
-    }
-}
-
-fn led_off() {
-    unsafe {
-        let odr = core::ptr::read_volatile(GPIOC_ODR);
-        core::ptr::write_volatile(GPIOC_ODR, odr | PIN13_BIT);
-    }
-}
-
-fn delay(cycles: u32) {
-    for _ in 0..cycles {
-        cortex_m::asm::nop();
-    }
-}
-
-/// Success: solid LED on, forever. Deliberately halts here instead of
-/// looping back to serve another request -- this is a one-shot bring-up
-/// test (paired with sender-sim), not continuous service mode yet.
-fn halt_success() -> ! {
-    led_on();
-    loop {
-        cortex_m::asm::nop();
-    }
-}
-
-/// Failure: blinks continuously, forever -- not a fixed short burst, so
-/// there's time to physically reposition the board and actually see it
-/// before it would stop.
-fn halt_failure() -> ! {
-    loop {
-        led_on();
-        delay(1_500_000);
-        led_off();
-        delay(1_500_000);
-    }
-}
-
-/// Adapts a polled usb-device + usbd-serial pair to harness_device's
-/// Transport trait. Both send and recv drive the USB poll loop
-/// themselves, since nothing else in this firmware services the USB
-/// peripheral in the background (no interrupt handler set up).
-struct UsbTransport<'a> {
-    usb_dev: UsbDevice<'a, UsbBusType>,
-    serial: SerialPort<'a, UsbBusType>,
-}
-
-impl<'a> Transport for UsbTransport<'a> {
-    type Error = ();
-
-    fn send(&mut self, bytes: &[u8]) -> Result<(), ()> {
-        let mut offset = 0;
-        while offset < bytes.len() {
-            self.usb_dev.poll(&mut [&mut self.serial]);
-            match self.serial.write(&bytes[offset..]) {
-                Ok(n) if n > 0 => offset += n,
-                Ok(_) => {}
-                Err(UsbError::WouldBlock) => {}
-                Err(_) => return Err(()),
-            }
-        }
-        Ok(())
-    }
-
-    fn recv(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
-        self.usb_dev.poll(&mut [&mut self.serial]);
-        match self.serial.read(buf) {
-            Ok(n) => {
-                if n > 0 {
-                    // Brief pulse: bytes physically arrived over USB.
-                    // Distinguishes "never got the frame" (no pulses at
-                    // all) from "got it, then hung/panicked processing
-                    // it" (pulses happen, then nothing else).
-                    led_on();
-                    delay(100_000);
-                    led_off();
-                }
-                Ok(n)
-            }
-            Err(UsbError::WouldBlock) => Ok(0),
-            Err(_) => Err(()),
-        }
-    }
-}
-
 #[entry]
 fn main() -> ! {
-    init_led();
-
-    unsafe {
-        ALLOCATOR
-            .lock()
-            .init(core::ptr::addr_of_mut!(HEAP) as *mut u8, 16 * 1024);
-    }
-
     let dp = pac::Peripherals::take().unwrap();
 
     let rcc = dp.RCC.constrain();
@@ -190,37 +55,41 @@ fn main() -> ! {
         hclk: clocks.hclk(),
     };
 
+    // usb-device needs the bus allocator and device objects to live for
+    // 'static. A static mut with unsafe access is the standard pattern
+    // here (single-threaded, no interrupts touching this yet).
     static mut EP_MEMORY: [u32; 1024] = [0; 1024];
     let usb_bus = UsbBus::new(usb, unsafe { &mut *core::ptr::addr_of_mut!(EP_MEMORY) });
 
-    let serial = SerialPort::new(&usb_bus);
-    let usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
+    let mut serial = SerialPort::new(&usb_bus);
+
+    // 0x16c0/0x27dd: the shared VID/PID voti.nl provides for open-source
+    // USB test devices (used throughout usb-device's own examples). Fine
+    // for bring-up; get a real VID/PID before this ships to anyone else.
+    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
         .strings(&[StringDescriptors::default()
             .manufacturer("payjoin-blackpill-test")
-            .product("harness-device receiver")
+            .product("harness-device USB CDC")
             .serial_number("0001")])
         .unwrap()
         .device_class(usbd_serial::USB_CLASS_CDC)
         .build();
 
-    let mut transport = UsbTransport { usb_dev, serial };
+    loop {
+        if !usb_dev.poll(&mut [&mut serial]) {
+            continue;
+        }
 
-    // Wait for the host to actually finish USB enumeration/configuration
-    // before handing off to run_receiver -- otherwise the first
-    // recv_frame call spins against an interface that isn't set up yet.
-    while transport.usb_dev.state() != UsbDeviceState::Configured {
-        transport.usb_dev.poll(&mut [&mut transport.serial]);
-    }
-
-    let receiver_script =
-        bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x22; 20]));
-
-    let result = run_receiver(&mut transport, "", |script: &bitcoin::Script| {
-        script == receiver_script.as_script()
-    });
-
-    match result {
-        Ok(_) => halt_success(),
-        Err(_) => halt_failure(),
+        let mut buf = [0u8; 64];
+        match serial.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                // Echo back exactly what we got. Best-effort write: if
+                // the host isn't ready yet, drop it rather than block --
+                // fine for an echo test, not fine for the real harness
+                // Transport (which needs write() to actually retry).
+                let _ = serial.write(&buf[..n]);
+            }
+            _ => {}
+        }
     }
 }
